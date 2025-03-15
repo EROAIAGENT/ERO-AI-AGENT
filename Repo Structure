@@ -1,0 +1,143 @@
+phasma-ai/
+├── .github/
+│   ├── workflows/
+│   │   ├── pr-validation.yml          # Code quality gates
+│   │   ├── release-cadence.yml        # Semantic versioning
+│   │   ├── security-scan.yml          # SAST/DAST scans
+│   │   └── performance-benchmark.yml  # Locust load tests
+│   ├── ISSUE_TEMPLATE/
+│   │   ├── BUG_REPORT.md
+│   │   └── FEATURE_REQUEST.md
+│   └── PULL_REQUEST_TEMPLATE.md
+│
+├── src/
+│   ├── core/
+│   │   ├── agent/
+│   │   │   ├── base_agent.py             # Abstract agent class
+│   │   │   ├── research_agent/           # RAG implementation
+│   │   │   │   ├── knowledge_retriever.py
+│   │   │   │   └── evidence_validator.py
+│   │   │   ├── coding_agent/             # Code generation
+│   │   │   │   ├── code_generator.py
+│   │   │   │   └── ast_validator.py
+│   │   │   └── orchestration_agent/      # Task management
+│   │   │       ├── dag_compiler.py
+│   │   │       └── resource_allocator.py
+│   │   ├── cognition/
+│   │   │   ├── llm/
+│   │   │   │   ├── api_adapters/        # OpenAI/Anthropic/etc.
+│   │   │   │   └── local_models/        # Quantized models
+│   │   │   └── reinforcement/
+│   │   │       ├── q_network.py         # RL policy network
+│   │   │       └── experience_buffer.py
+│   │   └── comms/
+│   │       ├── protocol/                # Agent messaging
+│   │       │   ├── pubsub_manager.py
+│   │       │   └── serialization.py
+│   │       └── discovery/               # Node management
+│   │           ├── consensus.py
+│   │           └── health_monitor.py
+│   │
+│   ├── infrastructure/
+│   │   ├── cloud/
+│   │   │   ├── aws/
+│   │   │   │   ├── lambda_layers/
+│   │   │   │   └── step_functions/
+│   │   │   └── kubernetes/
+│   │   │       ├── operator/            # Custom CRDs
+│   │   │       └── helm_charts/
+│   │   └── monitoring/
+│   │       ├── prometheus/              # Custom exporters
+│   │       └── opentelemetry/           # Distributed tracing
+│   │
+│   ├── api/
+│   │   ├── web/                         # REST API
+│   │   │   ├── fastapi_app.py
+│   │   │   ├── routes/
+│   │   │   └── middleware/
+│   │   └── grpc/                        # High-performance endpoints
+│   │       ├── protos/                  # Protocol buffers
+│   │       └── service_impl.py
+│   │
+│   └── security/
+│       ├── policy_engine/               # Rego policies
+│       ├── key_management/              # Vault integration
+│       └── sandbox/                     # WASM/containers
+│           ├── runtime/
+│           └── syscall_filter/
+│
+├── config/
+│   ├── env/
+│   │   ├── development.yaml
+│   │   ├── staging.yaml
+│   │   └── production.yaml
+│   └── feature_flags/                  # LaunchDarkly sync
+│       ├── ai_safety.yaml
+│       └── experimental_features.yaml
+│
+├── test/
+│   ├── unit/
+│   │   ├── agent/
+│   │   │   └── test_agent_lifecycle.py
+│   │   └── cognition/
+│   │       └── test_llm_integration.py
+│   ├── integration/
+│   │   ├── test_workflow_orchestration.py
+│   │   └── test_cluster_scaling.py
+│   ├── performance/
+│   │   ├── locustfile.py                # Load testing
+│   │   └── memory_profiling/
+│   └── data/                            # Test datasets
+│       ├── sample_workflows/
+│       └── benchmark_scripts/
+│
+├── docs/
+│   ├── ARCHITECTURE.md                  # C4 diagrams
+│   ├── API_REFERENCE.md                  # OpenAPI spec
+│   ├── DEV_GUIDE.md                      # Onboarding
+│   └── THREAT_MODEL.md                   # Security analysis
+│
+├── infrastructure/
+│   ├── terraform/                       # Multi-cloud IaC
+│   │   ├── modules/
+│   │   │   ├── network/
+│   │   │   └── kubernetes/
+│   │   └── environments/
+│   │       ├── dev/
+│   │       └── prod/
+│   └── kubernetes/
+│       ├── crds/                        # Custom resources
+│       ├── operators/                   # Controller logic
+│       └── manifests/                   # Kustomize bases
+│
+├── scripts/
+│   ├── deployment/
+│   │   ├── ansible/                     # Bare-metal provisioning
+│   │   └── database/                    # Schema migrations
+│   ├── benchmarks/
+│   │   ├── agent_throughput.py
+│   │   └── memory_usage.sh
+│   └── diagnostics/                     # Troubleshooting
+│       ├── stack_analyzer.py
+│       └── log_parser.py
+│
+├── third_party/                         # Forked dependencies
+│   ├── modified_llm_lib/
+│   └── patched_orchestrator/
+│
+├── examples/                            # Demo implementations
+│   ├── research_assistant/
+│   └── auto_devops_pipeline/
+│
+├── .env.sample                          # Environment template
+├── .gitignore                           # Extended patterns
+├── .pre-commit-config.yaml              # Linting hooks
+├── pyproject.toml                       # PEP 621 config
+├── requirements.txt                     # Pinned deps
+├── Makefile                             # Dev shortcuts
+├── Dockerfile                           # Multi-stage build
+├── docker-compose.yml                   # Local stack
+├── CODEOWNERS                           # Review assignments
+├── SECURITY.md                          # Vulnerability reporting
+├── LICENSE                              # Apache 2.0
+└── README.md                            # Project overview
