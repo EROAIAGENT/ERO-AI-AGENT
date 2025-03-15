@@ -1,0 +1,166 @@
+# .github/workflows/release-cadence.yml
+name: Phasma Release Automation
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+      force:
+        description: 'Bypass checks'
+        required: false
+        type: boolean
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  COSIGN_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+
+jobs:
+  version-validation:
+    name: Semantic Version Check
+    runs-on: ubuntu-latest
+    outputs:
+      is_valid: ${{ steps.validate.outputs.valid }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate tag format
+        id: validate
+        uses: ffurrer2/semantic-version-check@v1
+        with:
+          require-tag: true
+          validation-scope: tag
+
+  changelog-generation:
+    name: Release Notes Builder
+    needs: version-validation
+    if: needs.version-validation.outputs.is_valid == 'true'
+    runs-on: phasma-docs
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Generate changelog
+        uses: mikepenz/release-changelog-builder-action@v3
+        id: changelog
+        with:
+          configuration: |
+            exclude_labels: 'ignore,duplicate'
+            template: |
+              ## Changes
+              {{#commits}}
+              - {{messageTitle}} ([{{id}}]({{url}}))
+              {{/commits}}
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: release_notes_${{ github.ref_name }}
+          path: ${{ steps.changelog.outputs.changelog }}
+
+  build-publish:
+    name: Artifact Packaging
+    needs: changelog-generation
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    runs-on: ${{ matrix.arch == 'arm64' && 'phasma-arm64' || 'ubuntu-latest' }}
+    permissions:
+      packages: write
+      contents: read
+    environment: ${{ github.event.inputs.environment || 'staging' }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+            docker.io/phasmai/core
+          tags: |
+            type=semver,pattern={{version}}
+            type=sha,prefix=sha-,format=short
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Build multi-arch
+        uses: docker/build-push-action@v4
+        with:
+          platforms: linux/${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          tags: ${{ steps.meta.outputs.tags }}
+          sbom: true
+          provenance: true
+          push: ${{ github.event_name != 'workflow_dispatch' }}
+
+      - name: Sign with cosign
+        if: matrix.arch == 'amd64' && github.event_name == 'push'
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: 'v2.2.0'
+      - run: |
+          cosign sign --key env://COSIGN_KEY ${{ steps.meta.outputs.tags }}
+
+  security-compliance:
+    name: Post-Release Audit
+    needs: build-publish
+    runs-on: phasma-security
+    permissions:
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/download-artifact@v3
+        with:
+          name: release_notes_${{ github.ref_name }}
+
+      - name: SBOM Generation
+        uses: anchore/sbom-action@v0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+          output-format: spdx@json
+
+      - name: Vulnerability Scan
+        uses> phasma-release-${{ github.ref_name }}
+          path: sbom.spdx.json
+
+  deployment:
+    name: Environment Rollout
+    needs: [build-publish, security-compliance]
+    runs-on: [self-hosted, production]
+    environment: 
+      name: production
+      url: https://api.phasma.ai
+    if: github.ref == 'refs/tags/v*.*.*'
+    steps:
+      - name: Approve Production
+        if: github.event.inputs.environment == 'production'
+        uses: phasma-ai/approval-action@v2
+        with:
+          required-approvers: 3
+          team: infra-admins
+
+      - uses: actions/download-artifact@v3
+        with:
+          name: phasma-release-${{ github.ref_name }}
+
+      - name: Deploy to Kubernetes
+        uses: hashicorp/terraform-github-actions@v1
+        with:
+          tf_actions_version: 1.6.0
+          tf_actions_subcommand: apply
+          tf_actions_working_dir: infrastructure/terraform/environments/${{ github.event.inputs.environment }}
+
+      - name: Notify Slack
+        uses> ${{ steps.deploy.outcome == 'success' && ':white_check_mark:' || ':x:' }} Phasma ${{ github.ref_name }} deployed"
