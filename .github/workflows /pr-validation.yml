@@ -1,0 +1,159 @@
+# .github/workflows/pr-validation.yml
+name: Phasma PR Quality Gate
+
+on:
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'src/**'
+      - '!src/legacy/**'
+
+concurrency:
+  group: pr-${{ github.head_ref }}
+  cancel-in-progress: true
+
+jobs:
+  code-quality:
+    name: Static Analysis & Linting
+    runs-on: phasma-xlarge-runner
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          sparse-checkout: |
+            src/
+            config/
+            .github/
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: '**/requirements.txt'
+
+      - name: Semgrep SAST
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: p/security-audit
+          output: '--sarif --output semgrep-results.sarif'
+          args: '--metrics=off --disable-version-check'
+
+      - name: SonarQube Analysis
+        uses: SonarSource/sonarqube-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONARQUBE_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: >
+            -Dsonar.projectKey=phasma-core
+            -Dsonar.projectVersion=${{ github.sha }}
+            -Dsonar.sources=src/
+            -Dsonar.host.url=${{ vars.SONARQUBE_HOST }}
+            -Dsonar.python.coverage.reportPaths=coverage.xml
+
+  unit-tests:
+    name: Test Suite Validation
+    runs-on: ubuntu-22.04
+    needs: code-quality
+    strategy:
+      matrix:
+        test-group: [ 'agent', 'cognition', 'security', 'all' ]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install with PEP 621
+        run: pip install -e .[test]
+
+      - name: Run Pytest
+        run: |
+          pytest -v \
+            --cov=src \
+            --cov-report=xml:coverage.xml \
+            --cov-context=test \
+            -m "${{ matrix.test-group }}" \
+            --junitxml=junit-${{ matrix.test-group }}.xml
+        env:
+          PYTHONPATH: src/
+          TEST_ENV: ci
+
+      - name: Upload Coverage
+        uses: codecov/codecov-action@v3
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.xml
+          flags: unittests
+
+  security-scan:
+    name: Container & Dependency Audit
+    runs-on: phasma-security
+    timeout-minutes: 45
+    permissions:
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trivy Container Scan
+        uses: aquasecurity/trivy-action@0.13
+        with:
+          scan-type: 'fs'
+          ignore-unfixed: true
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          skip-dirs: |
+            .git
+            __pycache__
+          severity: 'CRITICAL,HIGH'
+          exit-code: 0
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v2
+        with: 
+          sarif_file: 'trivy-results.sarif'
+
+      - name: OSS License Audit
+        uses: advanced-security/pip-audit-action@v1
+        with:
+          requirements-file: requirements.txt
+          output-format: 'json'
+          output-file: 'pip-audit.json'
+
+  build-artifacts:
+    name: Artifact Compilation
+    needs: [ unit-tests, security-scan ]
+    runs-on: [ self-hosted, linux, x64 ]
+    env:
+      BUILD_ID: ${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Docker Build (Multi-arch)
+        uses: docker/build-push-action@v4
+        with:
+          platforms: linux/amd64,linux/arm64
+          tags: phasmaai/core:${{ env.BUILD_ID }}
+          outputs: 'type=image,push=false'
+
+      - name: Archive Artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: phasma-build-${{ env.BUILD_ID }}
+          path: |
+            dist/*
+            !**/*.log
+          retention-days: 7
+
+      - name: Trigger Downstream
+        if: success()
+        uses: peter-evans/repository-dispatch@v2
+        with:
+          token: ${{ secrets.REPO_ACCESS_TOKEN }}
+          repository: phasma-ai/infra
+          event-type: pr-validation-complete
+          client-payload: '{"pr_id": "${{ github.event.pull_request.number }}"}'
