@@ -1,0 +1,260 @@
+# environments/staging.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: phasma-staging
+  labels:
+    env: staging
+    owner: ai-ops-team
+    compliance: pci-dss
+
+---
+# PostgreSQL Cluster with Replication
+apiVersion: postgres-operator.crunchydata.com/v1beta1
+kind: PostgresCluster
+metadata:
+  name: phasma-pgcluster
+  namespace: phasma-staging
+spec:
+  image: registry.developers.crunchydata.com/crunchydata/crunchy-postgres:ubi8-15.4-0
+  postgresVersion: 15
+  instances:
+    - name: primary
+      replicas: 2
+      dataVolumeClaimSpec:
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: 100Gi
+      resources:
+        requests:
+          cpu: "2"
+          memory: 8Gi
+        limits:
+          cpu: "4" 
+          memory: 16Gi
+    - name: replica
+      replicas: 1
+      dataVolumeClaimSpec:
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: 100Gi
+
+---
+# Redis Sentinel Cluster
+apiVersion: redis.redis.opstreelabs.in/v1beta1
+kind: Redis
+metadata:
+  name: phasma-redis
+  namespace: phasma-staging
+spec:
+  kubernetesConfig:
+    image: redis:7.2
+    resources:
+      requests:
+        cpu: "1"
+        memory: 4Gi
+  storage:
+    volumeClaimTemplate:
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: 50Gi
+  sentinel:
+    enabled: true
+    replicas: 3
+
+---
+# RabbitMQ Cluster with TLS
+apiVersion: rabbitmq.com/v1beta1
+kind: RabbitmqCluster
+metadata:
+  name: phasma-rmq
+  namespace: phasma-staging
+spec:
+  replicas: 3
+  image: rabbitmq:3.12-management
+  resources:
+    requests:
+      cpu: "2"
+      memory: 4Gi
+  tls:
+    secretName: rmq-tls-cert
+    caSecretName: rmq-ca-cert
+  persistence:
+    storage: 100Gi
+
+---
+# Application Deployment with Auto-Scaling
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: phasma-core
+  namespace: phasma-staging
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: phasma-core
+  template:
+    metadata:
+      labels:
+        app: phasma-core
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9095"
+    spec:
+      serviceAccountName: phasma-sa
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 3000
+        fsGroup: 2000
+      containers:
+      - name: core
+        image: phasmaai/core:staging
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8080
+        envFrom:
+        - configMapRef:
+            name: phasma-config
+        - secretRef:
+            name: phasma-secrets
+        resources:
+          requests:
+            cpu: "1"
+            memory: 2Gi
+          limits:
+            cpu: "2"
+            memory: 4Gi
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+
+---
+# Horizontal Pod Autoscaler
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: phasma-hpa
+  namespace: phasma-staging
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: phasma-core
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+
+---
+# Network Policies
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: staging-egress
+  namespace: phasma-staging
+spec:
+  podSelector: {}
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          env: staging
+    ports:
+    - protocol: TCP
+      port: 5432 # PostgreSQL
+    - protocol: TCP  
+      port: 6379 # Redis
+    - protocol: TCP
+      port: 5672 # RabbitMQ
+
+---
+# Monitoring Stack
+apiVersion: monitoring.coreos.com/v1
+kind: Prometheus
+metadata:
+  name: prometheus
+  namespace: phasma-staging
+spec:
+  retention: 15d
+  replicas: 2
+  serviceAccountName: prometheus-sa
+  securityContext:
+    runAsUser: 1000
+    fsGroup: 2000
+  serviceMonitorSelector:
+    matchLabels:
+      release: prometheus
+
+---
+# Resource Quotas
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: staging-quota
+  namespace: phasma-staging
+spec:
+  hard:
+    requests.cpu: "20"
+    requests.memory: 100Gi
+    limits.cpu: "40"
+    limits.memory: 200Gi
+    pods: "100"
+    services.loadbalancers: "2"
+
+---
+# Pod Security Standards
+apiVersion: policy/v1
+kind: PodSecurityPolicy
+metadata:
+  name: staging-psp
+spec:
+  privileged: false
+  allowPrivilegeEscalation: false
+  requiredDropCapabilities:
+    - ALL
+  volumes:
+    - 'configMap'
+    - 'secret'
+  hostNetwork: false
+  hostIPC: false
+  hostPID: false
+  runAsUser:
+    rule: 'MustRunAsNonRoot'
+  seLinux:
+    rule: 'RunAsAny'
+  supplementalGroups:
+    rule: 'MustRunAs'
+    ranges:
+      - min: 1
+        max: 65535
+  fsGroup:
+    rule: 'MustRunAs'
+    ranges:
+      - min: 1
+        max: 65535
