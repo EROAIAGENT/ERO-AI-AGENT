@@ -1,0 +1,26 @@
+cloud/kubernetes/helm_charts/phasma-ai/
+├── Chart.yaml
+├── values.yaml
+├── charts/                          # Subcharts
+├── crds/                           # Custom Resources
+│   └── ai_agent_cluster.yaml
+├── templates/
+│   ├── _helpers.tpl                # Template utilities
+│   ├── namespace.yaml               # Environment isolation
+│   ├── rbac.yaml                    # Least privilege roles
+│   ├── secrets.yaml                 # Encrypted credentials
+│   ├── configmap-env.yaml           # Agent configurations 
+│   ├── statefulset-agent.yaml       # Core agent workloads
+│   ├── service-cluster.yaml         # Internal communication
+│   ├── hpa-agent.yaml               # Auto-scaling
+│   ├── network-policy.yaml          # Zero Trust rules
+│   ├── pdb-agent.yaml               # Availability guarantees
+│   ├── servicemonitor.yaml          # Prometheus integration
+│   └── ingress-api.yaml             # External API exposure
+├── requirements.yaml                # Dependencies
+├── ci/
+│   ├── values-dev.yaml              # Development profile
+│   ├── values-prod.yaml             # Production hardening
+│   └── values-security.yaml         # Compliance overrides
+└── tests/
+    └── test-connection.yaml         # Deployment validat
