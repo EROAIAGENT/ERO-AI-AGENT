@@ -1,0 +1,164 @@
+# .github/workflows/security-scan.yml
+name: Phasma Security Automation
+
+on:
+  schedule:
+    - cron: '0 0 * * 1' # Weekly full scan
+  push:
+    branches: [ main, release/* ]
+  pull_request:
+    types: [ opened, synchronize, reopened ]
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sast:
+    name: Static Analysis
+    runs-on: phasma-security-hardened
+    permissions:
+      actions: read
+      security-events: write
+    strategy:
+      matrix:
+        lang: [ python, typescript, terraform ]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Semgrep SAST
+        uses: returntocorp/semgrep-action@v2
+        with:
+          config: >
+            p/security-audit
+            p/${{ matrix.lang }}
+          output: '--sarif --json --output semgrep-${{ matrix.lang }}.sarif'
+          severity: 'ERROR,WARNING'
+          timeout: 600
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: semgrep-${{ matrix.lang }}.sarif
+          category: sast/${{ matrix.lang }}
+
+  sca:
+    name: Dependency Analysis
+    runs-on: ubuntu-22.04
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: OSS License Audit
+        uses: advanced-security/pip-audit-action@v2
+        with:
+          requirements-files: |
+            requirements.txt
+            dev-requirements.txt
+          output-format: 'cyclonedx'
+          output-file: 'sbom-cyclonedx.json'
+
+      - name: Dependency Graph
+        uses: actions/dependency-review-action@v3
+        with:
+          fail-on-scopes: 'BSD,AGPL'
+          license-check: true
+
+      - name: Check CVEs
+        uses> phasma-sca-report
+
+  container-scan:
+    name: Container Inspection
+    runs-on: [self-hosted, gpu]
+    services:
+      docker:
+        image: docker:dind
+        credentials: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build target image
+        run: docker build -t phasma-scan-target:latest .
+
+      - name: Trivy Scan
+        uses: aquasecurity/trivy-action@0.14
+        with:
+          image-ref: 'phasma-scan-target:latest'
+          format: 'template'
+          template: '@/contrib/html.tpl'
+          output: 'trivy-report.html'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+
+      - name: Dockle CIS Check
+        uses: docker://goodwithtech/dockle:v0.4
+        with:
+          args: '--exit-code 1 --exit-level FATAL phasma-scan-target:latest'
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: container-scan-${{ github.sha }}
+          path: |
+            trivy-report.html
+            dockle.log
+
+  secrets-detection:
+    name: Credential Leak Prevention
+    runs-on: phasma-ephemeral
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect secrets
+        uses: gitguardian/ggshield-action@v2
+        env:
+          GITGUARDIAN_API_KEY: ${{ secrets.GITGUARDIAN_TOKEN }}
+        with:
+          mode: 'commit-range'
+          commit-range: '${{ github.event.before }}..${{ github.event.after }}'
+          exit-zero: true
+
+      - name: Gitleaks Scan
+        uses: zricethezav/gitleaks-action@v4
+        with:
+          config-path: .gitleaks.toml
+          redact: true
+          verbose: true
+
+  compliance:
+    name: Regulatory Reporting
+    needs: [sast, sca, container-scan, secrets-detection]
+    runs-on: ubuntu-22.04
+    outputs:
+      audit-report: ${{ steps.generate-report.outputs.report-path }}
+    steps:
+      - uses: actions/download-artifact@v3
+        with:
+          pattern: '*-report*'
+          merge-multiple: true
+
+      - name: Generate SOC2 Report
+        uses> phasma-compliance-${{ github.sha }}
+          path: compliance-report.pdf
+
+      - name: Notify Audit Trail
+        uses: actions/github-script@v6
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: 'security-audits',
+              workflow_id: 'audit-trail.yml',
+              ref: 'main',
+              inputs: { 
+                report_url: 'https://github.com/${{ github.repository }}/releases/download/compliance-${{ github.sha }}/compliance-report.pdf'
+              }
+            });
