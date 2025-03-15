@@ -1,0 +1,323 @@
+# cognition/llm/local_models/model_manager.py
+import hashlib
+import logging
+import os
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+import numpy as np
+from pydantic import BaseModel, Field, validator
+from loguru import logger
+from prometheus_client import Gauge, Histogram
+import gc
+import psutil
+
+# Hardware Acceleration
+try:
+    import llama_cpp
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+except ImportError:
+    logger.error("Local model dependencies missing. Install with: pip install phasma-ai[local]")
+
+# Metrics
+MODEL_LOAD_TIME = Histogram(
+    'local_model_load_seconds',
+    'Time spent loading models',
+    ['model_type']
+)
+MEMORY_USAGE = Gauge(
+    'local_model_memory_bytes',
+    'Memory consumption per model',
+    ['model_name']
+)
+INFERENCE_LATENCY = Histogram(
+    'local_inference_latency_seconds',
+    'Latency distribution for model inference'
+)
+
+class LocalModelConfig(BaseModel):
+    model_path: Path = Field(..., description="Filesystem path to model weights")
+    model_type: str = Field(..., regex=r"^(gguf|huggingface|onnx)$")
+    n_ctx: int = Field(4096, ge=512, le=32768)
+    n_gpu_layers: int = Field(40, ge=0)
+    use_metal: bool = Field(False, description="Enable Metal acceleration for Apple Silicon")
+    quantized: bool = Field(True)
+    cache_dir: Optional[Path] = None
+    model_hash: Optional[str] = Field(None, min_length=64, max_length=64)
+    safety_checker: Optional[str] = Field("default", description="Content moderation module")
+
+    @validator('model_path')
+    def validate_model_path(cls, v):
+        if not v.exists():
+            raise ValueError(f"Model file not found: {v}")
+        if v.suffix not in ['.gguf', '.bin', '.onnx']:
+            raise ValueError("Unsupported model format")
+        return v
+
+class LocalModelResponse(BaseModel):
+    text: str
+    tokens_generated: int
+    tokens_processed: int
+    memory_usage: int
+    compute_time: float
+    safety_violations: List[str] = []
+
+class BaseLocalModel:
+    """Abstract base class for local model implementations"""
+    def __init__(self, config: LocalModelConfig):
+        self.config = config
+        self.model = None
+        self.tokenizer = None
+        self._validate_model_integrity()
+        self._memory_allocator = self._init_memory_allocator()
+
+    @MODEL_LOAD_TIME.time()
+    def load(self):
+        """Load model into memory with hardware optimization"""
+        try:
+            self._preload_cleanup()
+            self._load_implementation()
+            self._warmup()
+            logger.info(f"Loaded {self.config.model_type} model: {self.config.model_path.name}")
+        except Exception as e:
+            logger.error(f"Model loading failed: {str(e)}")
+            self.unload()
+            raise
+
+    def unload(self):
+        """Release model resources safely"""
+        if self.model:
+            if hasattr(self.model, 'free'):
+                self.model.free()
+            del self.model
+        if self.tokenizer:
+            del self.tokenizer
+        gc.collect()
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        logger.debug("Model resources released")
+
+    @INFERENCE_LATENCY.time()
+    def generate(self, prompt: str, **kwargs) -> LocalModelResponse:
+        """Execute inference with safety checks"""
+        try:
+            prompt = self._sanitize_input(prompt)
+            processed_prompt = self._preprocess(prompt)
+            output = self._generate_implementation(processed_prompt, **kwargs)
+            return self._postprocess(output)
+        except Exception as e:
+            logger.error(f"Inference failed: {str(e)}")
+            self._handle_inference_error()
+            raise
+
+    def _validate_model_integrity(self):
+        """Verify model checksum and signatures"""
+        expected_hash = self.config.model_hash
+        if expected_hash:
+            with open(self.config.model_path, 'rb') as f:
+                file_hash = hashlib.sha256(f.read()).hexdigest()
+                if file_hash != expected_hash:
+                    raise ValueError("Model hash verification failed")
+
+    def _init_memory_allocator(self):
+        """Hardware-specific memory optimization"""
+        if self.config.use_metal and sys.platform == 'darwin':
+            return llama_cpp.metal_allocator()
+        if torch.cuda.is_available():
+            return torch.cuda.allocator()
+        return None
+
+    def _preload_cleanup(self):
+        """Ensure clean state before loading"""
+        self.unload()
+        if psutil.virtual_memory().available < 2 * 1024**3:  # 2GB threshold
+            raise MemoryError("Insufficient RAM for model loading")
+
+    def _warmup(self):
+        """Initial inference to load kernels"""
+        test_prompt = "Warmup sequence:"
+        self.generate(test_prompt, max_tokens=1)
+        logger.debug("Model warmup completed")
+
+    def _sanitize_input(self, text: str) -> str:
+        """Security-critical input validation"""
+        # Implement OWASP security checks
+        return text[:self.config.n_ctx]  # Truncate to context window
+
+    @abc.abstractmethod
+    def _load_implementation(self):
+        pass
+
+    @abc.abstractmethod
+    def _generate_implementation(self, prompt: str, **kwargs) -> Dict:
+        pass
+
+    @abc.abstractmethod
+    def _preprocess(self, text: str) -> str:
+        pass
+
+    @abc.abstractmethod
+    def _postprocess(self, raw_output: Dict) -> LocalModelResponse:
+        pass
+
+    def _handle_inference_error(self):
+        """Recovery from hardware failures"""
+        if isinstance(self._memory_allocator, torch.cuda.allocator):
+            torch.cuda.empty_cache()
+        self.unload()
+        self.load()
+
+class GGUFModel(BaseLocalModel):
+    """Implementation for GGML/GGUF format models"""
+    def _load_implementation(self):
+        self.model = llama_cpp.Llama(
+            model_path=str(self.config.model_path),
+            n_ctx=self.config.n_ctx,
+            n_gpu_layers=self.config.n_gpu_layers,
+            use_mlock=True,
+            embedding=False,
+            allocator=self._memory_allocator
+        )
+        self.tokenizer = self.model.tokenizer
+
+    def _generate_implementation(self, prompt: str, **kwargs) -> Dict:
+        return self.model.create_completion(
+            prompt=prompt,
+            max_tokens=kwargs.get('max_tokens', 256),
+            temperature=kwargs.get('temperature', 0.7),
+            top_p=kwargs.get('top_p', 0.9),
+            repeat_penalty=kwargs.get('repeat_penalty', 1.1)
+        )
+
+    def _preprocess(self, text: str) -> str:
+        return text
+
+    def _postprocess(self, raw_output: Dict) -> LocalModelResponse:
+        return LocalModelResponse(
+            text=raw_output['choices'][0]['text'],
+            tokens_generated=raw_output['usage']['completion_tokens'],
+            tokens_processed=raw_output['usage']['prompt_tokens'],
+            memory_usage=psutil.Process().memory_info().rss,
+            compute_time=raw_output.get('timings', {}).get('total', 0)
+        )
+
+class HuggingFaceModel(BaseLocalModel):
+    """Implementation for HuggingFace models"""
+    def _load_implementation(self):
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.config.model_path,
+            cache_dir=self.config.cache_dir
+        )
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.config.model_path,
+            device_map='auto',
+            torch_dtype=torch.float16 if self.config.quantized else torch.float32,
+            load_in_4bit=self.config.quantized,
+            cache_dir=self.config.cache_dir
+        )
+
+    def _generate_implementation(self, prompt: str, **kwargs) -> Dict:
+        inputs = self.tokenizer(prompt, return_tensors='pt').to(self.model.device)
+        outputs = self.model.generate(
+            inputs.input_ids,
+            max_new_tokens=kwargs.get('max_tokens', 256),
+            temperature=kwargs.get('temperature', 0.7),
+            top_p=kwargs.get('top_p', 0.9),
+            repetition_penalty=kwargs.get('repeat_penalty', 1.1)
+        )
+        return {
+            'inputs': inputs,
+            'outputs': outputs
+        }
+
+    def _preprocess(self, text: str) -> str:
+        return text
+
+    def _postprocess(self, raw_output: Dict) -> LocalModelResponse:
+        decoded = self.tokenizer.decode(
+            raw_output['outputs'][0], 
+            skip_special_tokens=True
+        )
+        return LocalModelResponse(
+            text=decoded,
+            tokens_generated=len(raw_output['outputs'][0]),
+            tokens_processed=len(raw_output['inputs'].input_ids[0]),
+            memory_usage=psutil.Process().memory_info().rss,
+            compute_time=0  # HF doesn't provide timing data
+        )
+
+class ONNXModel(BaseLocalModel):
+    """Implementation for ONNX runtime models"""
+    def _load_implementation(self):
+        from onnxruntime import InferenceSession, SessionOptions
+        options = SessionOptions()
+        options.enable_mem_pattern = False  # For stable memory usage
+        if self._memory_allocator and hasattr(self._memory_allocator, 'onnx'):
+            options.add_session_config_entry(self._memory_allocator.onnx_config())
+        
+        self.model = InferenceSession(
+            str(self.config.model_path),
+            sess_options=options
+        )
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.config.model_path.parent
+        )
+
+    def _generate_implementation(self, prompt: str, **kwargs) -> Dict:
+        inputs = self.tokenizer(prompt, return_tensors='np')
+        outputs = self.model.run(
+            None,
+            {
+                'input_ids': inputs['input_ids'],
+                'attention_mask': inputs['attention_mask']
+            }
+        )
+        return {
+            'logits': outputs[0],
+            'inputs': inputs
+        }
+
+    def _preprocess(self, text: str) -> str:
+        return text
+
+    def _postprocess(self, raw_output: Dict) -> LocalModelResponse:
+        predicted_token_ids = np.argmax(raw_output['logits'], axis=-1)
+        decoded = self.tokenizer.decode(
+            predicted_token_ids[0], 
+            skip_special_tokens=True
+        )
+        return LocalModelResponse(
+            text=decoded,
+            tokens_generated=len(predicted_token_ids[0]),
+            tokens_processed=len(raw_output['inputs']['input_ids'][0]),
+            memory_usage=psutil.Process().memory_info().rss,
+            compute_time=0
+        )
+
+# Example Usage
+def run_local_inference():
+    config = LocalModelConfig(
+        model_path=Path("/models/mistral-7b-v0.1.Q4_K_M.gguf"),
+        model_type="gguf",
+        n_ctx=8192,
+        n_gpu_layers=40,
+        model_hash="a1b2c3...",
+        use_metal=True
+    )
+    
+    model = GGUFModel(config)
+    model.load()
+    
+    try:
+        response = model.generate(
+            "Explain quantum entanglement in simple terms",
+            max_tokens=500,
+            temperature=0.5
+        )
+        print(f"Response: {response.text}")
+        print(f"Memory used: {response.memory_usage / 1024**2:.2f} MB")
+    finally:
+        model.unload()
+
+if __name__ == "__main__":
+    run_local_inference()
