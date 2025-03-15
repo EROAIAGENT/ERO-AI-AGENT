@@ -1,0 +1,48 @@
+// MobileSDK/src/main/java/com/phasma/ai/LocalModelManager.kt
+package com.phasma.ai
+
+import android.content.Context
+import android.security.keystore.KeyProperties
+import androidx.security.crypto.EncryptedFile
+import androidx.security.crypto.MasterKey
+import org.tensorflow.lite.Interpreter
+import java.io.File
+import java.nio.ByteBuffer
+
+class SecureTFLiteModel(
+    context: Context, 
+    modelResId: Int,
+    private val authToken: String
+) {
+    private val modelFile: File
+    private val tflite: Interpreter
+    
+    init {
+        // Hardware-backed encryption for AI models
+        val masterKey = MasterKey.Builder(context)
+            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+            .build()
+        
+        modelFile = File(context.filesDir, "encrypted_model.tflite")
+        EncryptedFile.Builder(
+            context,
+            modelFile,
+            masterKey,
+            EncryptedFile.FileEncryptionScheme.AES256_GCM_HKDF_4KB
+        ).build().openFileOutput().use { os ->
+            context.resources.openRawResource(modelResId).copyTo(os)
+        }
+        
+        val options = Interpreter.Options().apply {
+            setUseXNNPACK(true)
+            setAllowFp16PrecisionForFp32(true)
+        }
+        tflite = Interpreter(modelFile, options)
+    }
+
+    fun secureInference(input: ByteBuffer): Map<Int, Any> {
+        val outputs = HashMap<Int, Any>()
+        tflite.runForMultipleInputsOutputs(arrayOf(input), outputs)
+        return outputs
+    }
+}
