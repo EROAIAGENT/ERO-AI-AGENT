@@ -1,0 +1,115 @@
+# cloud/aws/step_functions/state_machines/core_orchestration.asl.json
+{
+  "Comment": "Phasma AI Main Orchestration Workflow",
+  "StartAt": "InitializeTask",
+  "States": {
+    "InitializeTask": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${PhasmaInitFunctionArn}",
+        "Payload": {
+          "taskToken.$": "$$.Task.Token",
+          "input.$": "$"
+        }
+      },
+      "Next": "ParallelAgentExecution",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 1.5
+        }
+      ]
+    },
+    "ParallelAgentExecution": {
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "StartAt": "ResearchAgent",
+          "States": {
+            "ResearchAgent": {
+              "Type": "Task",
+              "Resource": "${ResearchAgentArn}",
+              "Next": "ValidateResearch"
+            },
+            "ValidateResearch": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ValidationFunctionArn}",
+                "Payload.$": "$"
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "CodeAgent",
+          "States": {
+            "CodeAgent": {
+              "Type": "Task",
+              "Resource": "${CodeAgentArn}",
+              "Next": "StaticAnalysis"
+            },
+            "StaticAnalysis": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${SASTFunctionArn}",
+                "Payload.$": "$"
+              },
+              "End": true
+            }
+          }
+        }
+      ],
+      "Next": "ConsolidateResults",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "GlobalErrorHandler"
+        }
+      ]
+    },
+    "ConsolidateResults": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ConsolidationFunctionArn}",
+        "Payload.$": "$"
+      },
+      "Next": "AuditTrail",
+      "ResultPath": "$.consolidated"
+    },
+    "AuditTrail": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:putItem",
+      "Parameters": {
+        "TableName": "${AuditTableName}",
+        "Item": {
+          "executionId": {"S.$": "$$.Execution.Id"},
+          "timestamp": {"S.$": "$$.State.EnteredTime"},
+          "results": {"S.$": "States.JsonToString($.consolidated)"},
+          "encryptedPayload": {
+            "B": {"awsKmsKeyId": "${KMSKeyArn}", "data.$": "$"}
+          }
+        }
+      },
+      "End": true
+    },
+    "GlobalErrorHandler": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${AlertTopicArn}",
+        "Message": {
+          "content.$": "States.JsonToString($)",
+          "errorDetails.$": "States.JsonToString($$.Error)"
+        }
+      },
+      "End": true
+    }
+  }
+}
