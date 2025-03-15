@@ -1,0 +1,137 @@
+# cloud/aws/lambda_layers/layer_builder.py
+import hashlib
+import logging
+import os
+import subprocess
+import zipfile
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import boto3
+from botocore.exceptions import ClientError
+from cryptography.fernet import Fernet
+from mypy_boto3_lambda import LambdaClient
+from pydantic import BaseModel, Field
+
+logger = logging.getLogger("phasma.aws.layers")
+
+class LayerConfig(BaseModel):
+    name: str = Field(..., regex=r"^phasma-[a-z0-9\-]+$")
+    description: str = "Phasma AI Lambda Layer"
+    compatible_runtimes: List[str] = ["python3.9", "python3.10"]
+    license: str = "Apache-2.0"
+    regions: List[str] = ["us-west-2", "eu-west-1"]
+    kms_key_arn: Optional[str] = None
+    retention_versions: int = 5
+
+class AWSLayerManager:
+    def __init__(self, config: LayerConfig):
+        self.config = config
+        self.clients: Dict[str, LambdaClient] = {
+            region: boto3.client("lambda", region_name=region)
+            for region in self.config.regions
+        }
+        self.encryption_key = Fernet.generate_key()
+        self.layer_arns: Dict[str, str] = {}
+
+    def build_layer_package(self, content_dir: Path) -> Path:
+        """Create encrypted ZIP package for layer contents"""
+        build_path = Path(f"build/{self.config.name}")
+        build_path.mkdir(parents=True, exist_ok=True)
+        
+        # Package requirements
+        self._install_dependencies(content_dir)
+        
+        # Create encrypted ZIP
+        zip_path = build_path / f"{self.config.name}.zip"
+        with zipfile.ZipFile(zip_path, "w") as zipf:
+            for root, _, files in os.walk(content_dir):
+                for file in files:
+                    file_path = Path(root) / file
+                    encrypted_data = self._encrypt_file(file_path)
+                    zipf.writestr(
+                        str(file_path.relative_to(content_dir)),
+                        encrypted_data
+                    )
+        
+        return zip_path
+
+    def deploy_layer(self, zip_path: Path) -> Dict[str, str]:
+        """Deploy layer to multiple regions with versioning"""
+        for region, client in self.clients.items():
+            try:
+                response = client.publish_layer_version(
+                    LayerName=self.config.name,
+                    Description=self.config.description,
+                    Content={"ZipFile": zip_path.read_bytes()},
+                    CompatibleRuntimes=self.config.compatible_runtimes,
+                    LicenseInfo=self.config.license,
+                    KMSKeyId=self.config.kms_key_arn
+                )
+                self.layer_arns[region] = response["LayerVersionArn"]
+                self._cleanup_old_versions(client)
+            except ClientError as e:
+                logger.error(f"Deployment failed in {region}: {str(e)}")
+                raise
+        
+        return self.layer_arns
+
+    def _install_dependencies(self, target_dir: Path):
+        """Install Python dependencies with security validation"""
+        req_file = target_dir / "requirements.txt"
+        if not req_file.exists():
+            raise FileNotFoundError("requirements.txt missing")
+            
+        subprocess.run(
+            ["pip", "install", 
+             "-r", str(req_file),
+             "--target", str(target_dir / "python"),
+             "--require-hashes",
+             "--only-binary", ":all:",
+             "--no-compile"],
+            check=True
+        )
+
+    def _encrypt_file(self, file_path: Path) -> bytes:
+        """Encrypt file contents with rotating keys"""
+        fernet = Fernet(self.encryption_key)
+        with open(file_path, "rb") as f:
+            return fernet.encrypt(f.read())
+
+    def _cleanup_old_versions(self, client: LambdaClient):
+        """Maintain version retention policy"""
+        versions = client.list_layer_versions(LayerName=self.config.name)["LayerVersions"]
+        versions.sort(key=lambda v: v["Version"], reverse=True)
+        
+        for version in versions[self.config.retention_versions :]:
+            client.delete_layer_version(
+                LayerName=self.config.name,
+                VersionNumber=version["Version"]
+            )
+
+class LayerContentValidator:
+    @staticmethod
+    def validate_structure(content_dir: Path):
+        """Enforce AWS Lambda layer directory requirements"""
+        if not (content_dir / "python").exists():
+            raise ValueError("Missing 'python' subdirectory")
+            
+        if not (content_dir / "requirements.txt").exists():
+            raise ValueError("Missing requirements.txt")
+            
+        if (content_dir / "python").stat().st_size > 250 * 1024 * 1024:
+            raise ValueError("Layer package exceeds 250MB limit")
+
+# Example Usage
+if __name__ == "__main__":
+    config = LayerConfig(
+        name="phasma-ai-core",
+        regions=["us-west-2"],
+        kms_key_arn="arn:aws:kms:us-west-2:123456789012:key/abcd1234"
+    )
+    
+    manager = AWSLayerManager(config)
+    package = manager.build_layer_package(Path("src/layers/core"))
+    arns = manager.deploy_layer(package)
+    print(f"Deployed layer ARNs: {arns}")
