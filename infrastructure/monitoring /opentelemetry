@@ -1,0 +1,48 @@
+# core/telemetry/otel_instrumentation.py
+import os
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.redis import RedisInstrumentor
+from opentelemetry.instrumentation.psycopg2 import Psycopg2Instrumentor
+
+def configure_telemetry(service_name: str, environment: str):
+    # Resource configuration
+    resource = Resource.create(
+        attributes={
+            "service.name": service_name,
+            "deployment.environment": environment,
+            "telemetry.sdk.version": "1.20.0",
+            "phasma.version": os.getenv("APP_VERSION", "unknown")
+        }
+    )
+
+    # Tracer setup
+    tracer_provider = TracerProvider(resource=resource)
+    trace.set_tracer_provider(tracer_provider)
+
+    # OTLP Exporter with security
+    otlp_exporter = OTLPSpanExporter(
+        endpoint=os.getenv("OTLP_ENDPOINT", "otel-collector:4317"),
+        insecure=bool(int(os.getenv("INSECURE_MODE", "0"))),
+        credentials=CompositeChannelCredentials(
+            ssl_channel_credentials(),
+            access_token_call_credentials(os.getenv("OTLP_TOKEN"))
+        ) if not bool(int(os.getenv("INSECURE_MODE", "0"))) else None
+    )
+
+    # Processor configuration
+    span_processor = BatchSpanProcessor(
+        otlp_exporter,
+        max_export_batch_size=512,
+        schedule_delay_millis=5000
+    )
+    tracer_provider.add_span_processor(span_processor)
+
+    # Auto-instrumentation
+    FastAPIInstrumentor().instrument()
+    RedisInstrumentor().enable()
+    Psycopg2Instrumentor().enable()
