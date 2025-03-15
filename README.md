@@ -7,6 +7,10 @@
 
 **Autonomous agents with dynamic orchestration enabling real-time R&D, coding & API automation via decentralized collaboration.**
 
+[Phasma AI Website](https://phasmaai.com/)
+
+📢 [Twitter](https://twitter.com/PhasmaAILAB)  
+
 ##  Core Capabilities
 
 ### Multi-Agent Collaboration
