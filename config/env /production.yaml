@@ -1,0 +1,283 @@
+# environments/production/production.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: phasma-prod
+  labels:
+    env: production
+    compliance: soc2-type2
+
+---
+### Global Infrastructure Configuration ###
+
+# Cross-Cloud PostgreSQL Cluster
+apiVersion: postgres-operator.crunchydata.com/v1beta1
+kind: PostgresCluster
+metadata:
+  name: phasma-postgres
+  namespace: phasma-prod
+spec:
+  image: registry.developers.crunchydata.com/crunchydata/crunchy-postgres:ubi8-15.4-0
+  postgresVersion: 15
+  instances:
+    - name: primary
+      replicas: 3
+      dataVolumeClaimSpec:
+        storageClassName: gp3-encrypted
+        resources:
+          requests:
+            storage: 1Ti
+      resources:
+        requests:
+          cpu: "4"
+          memory: 16Gi
+        limits:
+          cpu: "8"
+          memory: 32Gi
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: postgres-operator.crunchydata.com/instance-set
+                operator: In
+                values: ["primary"]
+            topologyKey: topology.kubernetes.io/zone
+  backups:
+    pgbackrest:
+      repos:
+      - name: global-backup
+        s3:
+          bucket: phasma-postgres-backups
+          endpoint: s3.amazonaws.com
+          region: us-west-2
+
+---
+# Redis Enterprise Cluster
+apiVersion: app.redislabs.com/v1alpha1
+kind: RedisEnterpriseCluster
+metadata:
+  name: phasma-redis
+  namespace: phasma-prod
+spec:
+  nodes: 6
+  redisEnterpriseNodeResources:
+    limits:
+      cpu: "4"
+      memory: 32Gi
+    requests:
+      cpu: "2"
+      memory: 16Gi
+  persistentSpec:
+    storageClassName: gp3-encrypted
+    volumeSize: 500Gi
+  uiServiceType: LoadBalancer
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+    - labelSelector:
+        matchLabels:
+          app: redis-enterprise
+      topologyKey: topology.kubernetes.io/zone
+
+---
+# Multi-Cloud RabbitMQ Cluster
+apiVersion: rabbitmq.com/v1beta1
+kind: RabbitmqCluster
+metadata:
+  name: phasma-rmq
+  namespace: phasma-prod
+spec:
+  replicas: 5
+  image: rabbitmq:3.12-management
+  resources:
+    requests:
+      cpu: "4"
+      memory: 16Gi
+    limits:
+      cpu: "8"
+      memory: 32Gi
+  tls:
+    secretName: rmq-tls-prod
+    caSecretName: rmq-ca-prod
+  persistence:
+    storageClassName: gp3-encrypted
+    storage: 2Ti
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: phasma-rmq
+        topologyKey: topology.kubernetes.io/zone
+
+---
+### Core Application Deployment ###
+
+# AI Agent Pool (StatefulSet for Persistent Agents)
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: phasma-agents
+  namespace: phasma-prod
+spec:
+  serviceName: phasma-agent
+  replicas: 100
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app: phasma-agent
+  template:
+    metadata:
+      labels:
+        app: phasma-agent
+        version: v2.4.1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
+    spec:
+      serviceAccountName: phasma-agent-sa
+      securityContext:
+        runAsUser: 10000
+        runAsGroup: 10000
+        fsGroup: 10000
+      containers:
+      - name: agent
+        image: phasmaai/agent:v2.4.1
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 9090
+        envFrom:
+        - configMapRef:
+            name: phasma-agent-config
+        - secretRef:
+            name: phasma-agent-secrets
+        resources:
+          requests:
+            cpu: "1"
+            memory: 4Gi
+          limits:
+            cpu: "2"
+            memory: 8Gi
+        volumeMounts:
+        - name: agent-storage
+          mountPath: /var/phasma
+        livenessProbe:
+          exec:
+            command:
+            - /bin/grpc_health_probe
+            - -addr=:9090
+          initialDelaySeconds: 30
+        readinessProbe:
+          exec:
+            command:
+            - /bin/grpc_health_probe
+            - -addr=:9090
+  volumeClaimTemplates:
+  - metadata:
+      name: agent-storage
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      storageClassName: gp3-encrypted
+      resources:
+        requests:
+          storage: 100Gi
+
+---
+### Service Mesh Configuration (Istio) ###
+
+# Istio VirtualService for Canary Deployments
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: phasma-vs
+  namespace: phasma-prod
+spec:
+  hosts:
+  - phasma.example.com
+  gateways:
+  - phasma-gateway
+  http:
+  - route:
+    - destination:
+        host: phasma-agents
+        subset: v2
+      weight: 95
+    - destination:
+        host: phasma-agents
+        subset: v3
+      weight: 5
+    retries:
+      attempts: 3
+      retryOn: gateway-error,connect-failure
+
+---
+### Monitoring & Observability ###
+
+# Prometheus Cluster with Thanos
+apiVersion: monitoring.coreos.com/v1
+kind: Prometheus
+metadata:
+  name: prometheus-prod
+  namespace: phasma-prod
+spec:
+  replicas: 3
+  retention: 30d
+  thanos:
+    objectStorageConfig:
+      key: thanos.yaml
+      name: thanos-objstore-config
+  serviceMonitorSelector:
+    matchLabels:
+      release: prometheus-prod
+  alerting:
+    alertmanagers:
+    - namespace: phasma-prod
+      name: alertmanager-prod
+      port: web
+
+---
+### Security Controls ###
+
+# Network Policy (Zero Trust Model)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: phasma-zero-trust
+  namespace: phasma-prod
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          istio-injection: enabled
+    ports:
+    - protocol: TCP
+      port: 9090
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          env: production
+    ports:
+    - protocol: TCP
+      port: 5432
+    - protocol: TCP
+      port: 6379
+
+---
+### Deployment & Verification ###
+
+# Apply Configuration
+kubectl apply -f production.yaml
+
+# Verify Cluster Status
+kubectl get postgrescluster,redisenterprisecluster,rabbitmqcluster -n phasma-prod
+kubectl get pods -n phasma-prod -l app=phasma-agents
+
+# Access Monitoring
+kubectl port-forward svc/prometheus-prod 9090 -n phasma-prod
