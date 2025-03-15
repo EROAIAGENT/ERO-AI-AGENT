@@ -1,0 +1,79 @@
+# monitoring/prometheus/values-prod.yaml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 30s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - alertmanager.phasma-prod.svc.cluster.local:9093
+
+rule_files:
+  - /etc/prometheus/rules/*.yaml
+
+storage:
+  tsdb:
+    retention: 30d
+    out_of_order_time_window: 1h
+  exemplars:
+    enabled: true
+
+persistence:
+  enabled: true
+  storageClass: gp3-encrypted
+  size: 2Ti
+  accessModes:
+    - ReadWriteOnce
+
+securityContext:
+  fsGroup: 2000
+  runAsUser: 1000
+  runAsNonRoot: true
+
+serviceMonitorSelectorNilUsesHelmValues: false
+
+podMonitorSelectorNilUsesHelmValues: false
+
+serviceAccount:
+  create: true
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT_ID:role/phasma-prometheus
+
+thanos:
+  create: true
+  objectStorageConfig:
+    secretName: thanos-objstore-config
+    type: s3
+
+remoteWrite:
+  - url: https://vpc-prometheus-workspace.REGION.amazonaws.com/workspaces/WS_ID/api/v1/remote_write
+    sigv4:
+      region: us-west-2
+    queue_config:
+      max_samples_per_send: 10000
+      capacity: 20000
+    write_relabel_configs:
+      - source_labels: [__name__]
+        regex: "(phasma_api_latency_seconds.*|phasma_agent_cpu_usage.*)"
+        action: keep
+
+alertmanager:
+  enabled: true
+  persistentVolume:
+    storageClass: gp3-encrypted
+    size: 100Gi
+  config:
+    global:
+      resolve_timeout: 5m
+    route:
+      group_by: ['job']
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 12h
+      receiver: 'critical'
+    receivers:
+      - name: 'critical'
+        webhook_configs:
+          - url: 'http://phasma-alert-processor.prod.svc.cluster.local:9095/webhook'
+            send_resolved: true
