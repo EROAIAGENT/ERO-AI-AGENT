@@ -1,0 +1,185 @@
+# .github/workflows/performance-benchmark.yml
+name: Phasma Performance Benchmark
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'src/core/**'
+      - 'src/llm/**'
+  release:
+    types: [ published ]
+
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_PERF_ACCESS_KEY }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_PERF_SECRET_KEY }}
+  S3_BUCKET: phasma-benchmarks
+  PROMETHEUS_URL: http://prometheus:9090
+  GRAFANA_URL: http://grafana:3000
+
+jobs:
+  load-test:
+    name: Agent Orchestration Load
+    runs-on: phasma-highmem
+    timeout-minutes: 120
+    strategy:
+      matrix:
+        scale: [10, 100, 1000]
+        test_type: [cpu_bound, io_bound]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Locust
+        run: |
+          python -m pip install locust==2.15.1
+          sudo apt-get install -y libhwloc-dev
+
+      - name: Run Distributed Load Test
+        env:
+          LOCUST_HEADLESS: true
+          LOCUST_USERS: ${{ matrix.scale }}
+          LOCUST_SPAWN_RATE: ${{ matrix.scale / 10 }}
+        run: |
+          locust -f tests/load/agent_orchestration.py \
+            --host http://${{ vars.PERF_ENDPOINT }} \
+            --tags ${{ matrix.test_type }} \
+            --csv=load-${{ matrix.test_type }}-${{ matrix.scale }} \
+            --html=load-report-${{ matrix.test_type }}-${{ matrix.scale }}.html \
+            --junitxml=load-${{ matrix.test_type }}-${{ matrix.scale }}.xml
+
+      - name: Upload Results
+        uses: actions/upload-artifact@v3
+        with:
+          name: load-test-${{ matrix.test_type }}-${{ matrix.scale }}
+          path: |
+            load-*-${{ matrix.test_type }}-${{ matrix.scale }}.*
+
+  stress-test:
+    name: API Stress Validation
+    runs-on: [self-hosted, high-perf]
+    needs: load-test
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: K6 Installation
+        uses: grafana/k6-action@v0
+        with:
+          k6-version: v0.47.0
+
+      - name: Run Spike Test
+        run: |
+          k6 run --out json=stress-metrics.json \
+            --vus 1000 --duration 30m \
+            tests/stress/api_composite.js
+
+      - name: Generate Flamegraph
+        uses: Netflix/flamescope-action@v2
+        with:
+          input: stress-metrics.json
+          output: flamegraph.html
+
+      - name: Archive Results
+        uses: actions/upload-artifact@v3
+        with:
+          name: stress-test-${{ github.sha }}
+          path: |
+            stress-metrics.json
+            flamegraph.html
+
+  resource-monitoring:
+    name: Infrastructure Telemetry
+    runs-on: ubuntu-22.04
+    services:
+      prometheus:
+        image: prom/prometheus:v2.47.0
+        ports:
+          - 9090:9090
+        volumes:
+          - ./config/prometheus.yml:/etc/prometheus/prometheus.yml
+      grafana:
+        image: grafana/grafana-enterprise:10.1.0
+        ports:
+          - 3000:3000
+        env:
+          GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Start Monitoring
+        run: |
+          docker compose -f infrastructure/monitoring/docker-compose.yml up -d
+          sleep 30 # Wait for services
+
+      - name: Collect Metrics
+        run: |
+          curl -X POST "$PROMETHEUS_URL/api/v1/admin/tsdb/snapshot"
+          aws s3 cp $PROMETHEUS_URL/metrics s3://$S3_BUCKET/${{ github.run_id }}/prometheus/
+
+      - name: Generate Grafana Report
+        uses: grafana/reporting-action@v1
+        with:
+          api-key: ${{ secrets.GRAFANA_API_KEY }}
+          dashboard-uid: phasma-perf
+          from: now-1h
+          to: now
+          output-format: PDF
+
+      - name: Persist Reports
+        uses: actions/upload-artifact@v3
+        with:
+          name: monitoring-${{ github.sha }}
+          path: grafana-report.pdf
+
+  benchmark-analysis:
+    name: Historical Comparison
+    runs-on: ubuntu-22.04
+    needs: [load-test, stress-test, resource-monitoring]
+    outputs:
+      regression: ${{ steps.analysis.outputs.regression }}
+    steps:
+      - uses: actions/download-artifact@v3
+      
+      - name: Download Baseline
+        run: |
+          aws s3 sync s3://$S3_BUCKET/latest/ baseline/
+
+      - name: Run Statistical Analysis
+        id: analysis
+        uses: phasma-ai/benchmark-comparison-action@v3
+        with:
+          current-results: load-test-*
+          baseline-path: baseline/
+          threshold: 'p<0.05'
+          metric: 'throughput'
+
+      - name: Post Metrics
+        uses: phasma-ai/metrics-webhook@v2
+        if: always()
+        with:
+          endpoint: ${{ vars.METRICS_INGEST_URL }}
+          auth-token: ${{ secrets.METRICS_API_KEY }}
+          data: |
+            {
+              "run_id": "${{ github.run_id }}",
+              "throughput": "${{ steps.analysis.outputs.throughput }}",
+              "latency": "${{ steps.analysis.outputs.latency }}",
+              "regression": "${{ steps.analysis.outputs.regression }}"
+            }
+
+      - name: Notify Slack
+        if: steps.analysis.outputs.regression == 'true'
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: 'C02ABCDEF'
+          slack-message: |
+            :warning: Performance regression detected in ${{ github.sha }}!
+            *Throughput change*: ${{ steps.analysis.outputs.throughput_delta }}%
+            View full report: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_PERF_BOT_TOKEN }}
