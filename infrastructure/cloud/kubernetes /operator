@@ -1,0 +1,39 @@
+# cloud/kubernetes/operator/crds/ai_agent_cluster.yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: aiclusters.phasma.ai
+spec:
+  group: phasma.ai
+  names:
+    kind: AICluster
+    plural: aiclusters
+    singular: aicluster
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        properties:
+          spec:
+            properties:
+              agentType:
+                enum: [research, coding, orchestration]
+                type: string
+              replicas:
+                minimum: 1
+                maximum: 1000
+                type: integer
+              resourceProfile:
+                type: string
+                enum: [cpu-optimized, memory-optimized, gpu]
+              securityContext:
+                $ref: '#/components/schemas/SecurityProfile'
+            required: [agentType, replicas]
+    served: true
+    storage: true
+    subresources:
+      status: {}
+      scale:
+        labelSelectorPath: .status.selector
+        replicasPath: .spec.replicas
