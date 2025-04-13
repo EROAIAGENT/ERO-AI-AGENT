@@ -1,5 +1,5 @@
 # .github/workflows/release-cadence.yml
-name: Phasma Release Automation
+name: Ero Release Automation
 
 on:
   push:
