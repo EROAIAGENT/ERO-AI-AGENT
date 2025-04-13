@@ -1,4 +1,4 @@
-# Phasma AI Pull Request
+# Ero AI Pull Request
 
 <!-- Replace brackets with 'x' to select -->
 **Type**: 
@@ -9,7 +9,7 @@
 - [ ] Documentation Update
 
 ## Overview
-**JIRA Ticket**: [PHASMA-XXXX](https://your-jira-instance/browse/PHASMA-XXXX)  
+**JIRA Ticket**: [Ero-XXXX](https://your-jira-instance/browse/Ero-XXXX)  
 **Architecture Doc**: [Confluence Link](https://your-confluence/arch)  
 **Semantic Commit**: `feat(core): implement dynamic agent allocation`
 
