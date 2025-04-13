@@ -1,4 +1,4 @@
-# Phasma AI Bug Report
+# Ero AI Bug Report
 
 <!-- Validate existing issues first: https://github.com/your-org/phasma-ai/issues -->
 
