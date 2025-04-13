@@ -1,5 +1,5 @@
 # .github/workflows/pr-validation.yml
-name: Phasma PR Quality Gate
+name: Ero PR Quality Gate
 
 on:
   pull_request:
