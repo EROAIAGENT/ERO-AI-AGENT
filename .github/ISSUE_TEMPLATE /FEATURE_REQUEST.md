@@ -1,6 +1,6 @@
-# Phasma AI Feature Request
+# Ero AI Feature Request
 
-<!-- Check existing RFCs: https://github.com/your-org/phasma-ai/discussions?discussions_q=category:RFC -->
+<!-- Check existing RFCs: https://github.com/your-org/Ero-ai/discussions?discussions_q=category:RFC -->
 
 ## Business Objective
 **Problem Statement**:  
