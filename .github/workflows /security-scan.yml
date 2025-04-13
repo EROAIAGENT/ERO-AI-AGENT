@@ -1,5 +1,5 @@
 # .github/workflows/security-scan.yml
-name: Phasma Security Automation
+name: Ero Security Automation
 
 on:
   schedule:
