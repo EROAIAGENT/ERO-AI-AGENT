@@ -1,5 +1,5 @@
-// MobileSDK/src/main/java/com/phasma/ai/LocalModelManager.kt
-package com.phasma.ai
+// MobileSDK/src/main/java/com/Ero/ai/LocalModelManager.kt
+package com.Ero.ai
 
 import android.content.Context
 import android.security.keystore.KeyProperties
