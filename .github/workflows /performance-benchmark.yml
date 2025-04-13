@@ -1,5 +1,5 @@
 # .github/workflows/performance-benchmark.yml
-name: Phasma Performance Benchmark
+name: Ero Performance Benchmark
 
 on:
   push:
@@ -13,14 +13,14 @@ on:
 env:
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_PERF_ACCESS_KEY }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_PERF_SECRET_KEY }}
-  S3_BUCKET: phasma-benchmarks
+  S3_BUCKET: Ero-benchmarks
   PROMETHEUS_URL: http://prometheus:9090
   GRAFANA_URL: http://grafana:3000
 
 jobs:
   load-test:
     name: Agent Orchestration Load
-    runs-on: phasma-highmem
+    runs-on: Ero-highmem
     timeout-minutes: 120
     strategy:
       matrix:
